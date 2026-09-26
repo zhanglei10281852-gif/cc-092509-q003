@@ -189,6 +189,9 @@ CREATE TABLE IF NOT EXISTS dossiers (
     lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('received','available','access_loaned','partially_disclosed','disclosed','quarantined','pending_disposal','disposed')),
     vault_id INTEGER REFERENCES vault_locations(id),
     custody_user_id INTEGER REFERENCES users(id),
+    secrecy_level TEXT NOT NULL DEFAULT 'internal' CHECK(secrecy_level IN ('internal','confidential','restricted','top_secret')),
+    publication_state TEXT NOT NULL DEFAULT 'unpublished' CHECK(publication_state IN ('unpublished','patent_published')),
+    patent_published_at TEXT,
     provenance_depth INTEGER NOT NULL DEFAULT 0,
     version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
@@ -335,6 +338,102 @@ CREATE TABLE IF NOT EXISTS dossier_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dossier_events_dossier ON dossier_events(dossier_id, id);
+
+CREATE TABLE IF NOT EXISTS secrecy_project_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_code TEXT NOT NULL UNIQUE,
+    lifecycle_stage TEXT NOT NULL DEFAULT 'research' CHECK(lifecycle_stage IN ('research','mass_production')),
+    secrecy_office_owner_id INTEGER REFERENCES users(id),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS secrecy_policy_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_code TEXT NOT NULL,
+    asset_type TEXT NOT NULL,
+    lifecycle_stage TEXT NOT NULL CHECK(lifecycle_stage IN ('research','mass_production')),
+    publication_state TEXT NOT NULL CHECK(publication_state IN ('unpublished','patent_published')),
+    suggested_level TEXT NOT NULL CHECK(suggested_level IN ('internal','confidential','restricted','top_secret')),
+    rationale TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    updated_by INTEGER REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(project_code, asset_type, lifecycle_stage, publication_state)
+);
+
+CREATE TABLE IF NOT EXISTS secrecy_adjustment_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_code TEXT NOT NULL UNIQUE,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    direction TEXT NOT NULL CHECK(direction IN ('upgrade','downgrade')),
+    old_level TEXT NOT NULL CHECK(old_level IN ('internal','confidential','restricted','top_secret')),
+    new_level TEXT NOT NULL CHECK(new_level IN ('internal','confidential','restricted','top_secret')),
+    reason TEXT NOT NULL,
+    basis_code TEXT NOT NULL,
+    basis_detail TEXT NOT NULL DEFAULT '',
+    requested_by INTEGER NOT NULL REFERENCES users(id),
+    state TEXT NOT NULL CHECK(state IN ('pending','approved','rejected','expired','cancelled','applied')),
+    review_deadline TEXT NOT NULL,
+    applied_at TEXT,
+    applied_by INTEGER REFERENCES users(id),
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(old_level <> new_level)
+);
+CREATE INDEX IF NOT EXISTS idx_secrecy_requests_dossier ON secrecy_adjustment_requests(dossier_id, id);
+CREATE INDEX IF NOT EXISTS idx_secrecy_requests_state ON secrecy_adjustment_requests(state);
+
+CREATE TABLE IF NOT EXISTS secrecy_adjustment_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    request_id INTEGER NOT NULL REFERENCES secrecy_adjustment_requests(id) ON DELETE CASCADE,
+    reviewer_user_id INTEGER NOT NULL REFERENCES users(id),
+    reviewer_kind TEXT NOT NULL CHECK(reviewer_kind IN ('secrecy_office','peer')),
+    decision TEXT NOT NULL CHECK(decision IN ('approve','reject')),
+    comment TEXT NOT NULL DEFAULT '',
+    reviewed_at TEXT NOT NULL,
+    UNIQUE(request_id, reviewer_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS secrecy_level_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    request_id INTEGER REFERENCES secrecy_adjustment_requests(id),
+    change_kind TEXT NOT NULL CHECK(change_kind IN ('initial','upgrade','downgrade','temporary_decrypt','temp_decrypt_expired','temp_decrypt_revoked')),
+    old_level TEXT CHECK(old_level IN ('internal','confidential','restricted','top_secret')),
+    new_level TEXT NOT NULL CHECK(new_level IN ('internal','confidential','restricted','top_secret')),
+    effective_at TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    basis_code TEXT NOT NULL DEFAULT '',
+    actor_user_id INTEGER REFERENCES users(id),
+    actor_name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_secrecy_history_dossier ON secrecy_level_history(dossier_id, id);
+
+CREATE TABLE IF NOT EXISTS temporary_declassifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    grant_code TEXT NOT NULL UNIQUE,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    access_loan_id INTEGER NOT NULL REFERENCES access_loans(id),
+    base_level TEXT NOT NULL CHECK(base_level IN ('internal','confidential','restricted','top_secret')),
+    granted_by INTEGER NOT NULL REFERENCES users(id),
+    reason TEXT NOT NULL,
+    starts_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    revoke_reason TEXT NOT NULL DEFAULT '',
+    revoked_by INTEGER REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(expires_at > starts_at)
+);
+CREATE INDEX IF NOT EXISTS idx_temp_declass_dossier ON temporary_declassifications(dossier_id);
+CREATE INDEX IF NOT EXISTS idx_temp_declass_loan ON temporary_declassifications(access_loan_id);
+CREATE INDEX IF NOT EXISTS idx_temp_declass_expires ON temporary_declassifications(expires_at);
 """
 
 PERMISSIONS = [
@@ -353,6 +452,11 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("vaults.read_sensitive", "查看精确密级库位", "vaults", "read_sensitive"),
     ("incidents.manage", "管理泄密事件", "incidents", "manage"),
+    ("secrecy.policy.manage", "维护密级策略与专利公开登记", "secrecy", "policy_manage"),
+    ("secrecy.adjust.request", "发起密级调整申请", "secrecy", "adjust_request"),
+    ("secrecy.review", "复核密级调整申请", "secrecy", "review"),
+    ("secrecy.office", "保密办公室成员资格", "secrecy", "office"),
+    ("secrecy.declassify", "授予或撤销临时解密", "secrecy", "declassify"),
 ]
 
 
@@ -416,6 +520,7 @@ def init_db() -> None:
             ("dossier_manager", "档案管理员", "维护档案、批次、位置、查阅借阅与载体盘点"),
             ("researcher", "研究人员", "查看档案并申请查阅借阅或登记对外合作披露使用"),
             ("approver", "风险审批人", "复核合规处置、位置解密与载体盘点调整"),
+            ("secrecy_officer", "保密办公室", "维护密级策略、复核密级调整并授予临时解密"),
             ("auditor", "审计查看员", "只读查看档案事件和审计记录"),
         )
         for code, name, description in roles:
@@ -432,9 +537,18 @@ def init_db() -> None:
             "dossier_manager": [
                 "dossiers.read", "dossiers.write", "dossiers.disclose", "dossiers.dispose",
                 "access_loans.manage", "inventory_review.manage", "incidents.manage",
+                "secrecy.adjust.request",
             ],
             "researcher": ["dossiers.read", "dossiers.disclose"],
-            "approver": ["dossiers.read", "approvals.decide"],
+            "approver": ["dossiers.read", "approvals.decide", "secrecy.review"],
+            "secrecy_officer": [
+                "dossiers.read",
+                "secrecy.policy.manage",
+                "secrecy.adjust.request",
+                "secrecy.review",
+                "secrecy.office",
+                "secrecy.declassify",
+            ],
             "auditor": ["dossiers.read", "audit.read"],
         }
         for role_code, permission_codes in role_permissions.items():
@@ -444,6 +558,20 @@ def init_db() -> None:
                 f"INSERT OR IGNORE INTO role_permissions(role_id,permission_id,granted_at) "
                 f"SELECT ?,id,? FROM permissions WHERE code IN ({placeholders})",
                 (role_id, now, *permission_codes),
+            )
+        from app.archives.secrecy_policy import canonical_rules
+
+        for rule in canonical_rules():
+            connection.execute(
+                """INSERT OR IGNORE INTO secrecy_policy_rules(
+                       project_code,asset_type,lifecycle_stage,publication_state,
+                       suggested_level,rationale,active,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,'1',?,?)""",
+                (
+                    rule["project_code"], rule["asset_type"], rule["lifecycle_stage"],
+                    rule["publication_state"], rule["suggested_level"], rule["rationale"],
+                    now, now,
+                ),
             )
 
 

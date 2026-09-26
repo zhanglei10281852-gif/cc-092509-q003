@@ -6,16 +6,21 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api import audit, auth, roles, system, users
-from app.core.errors import DomainError
-from app.database import close_connection, init_db
 from app.archives.router import router as archives_router
 from app.archives.extended_router import router as archive_operations_router
+from app.archives.secrecy_router import router as secrecy_router
+from app.archives.secrecy import sweep_expired
+from app.core.errors import DomainError
+from app.database import close_connection, get_connection, init_db, transaction
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     del app
     init_db()
+    # 过期授权只按数据库时间判定；每次启动先清理，保证重启后不会复活。
+    with transaction(immediate=True) as connection:
+        sweep_expired(connection)
     yield
     close_connection()
 
@@ -39,6 +44,7 @@ app.include_router(audit.router)
 app.include_router(system.router)
 app.include_router(archives_router)
 app.include_router(archive_operations_router)
+app.include_router(secrecy_router)
 
 
 @app.get("/")

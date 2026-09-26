@@ -12,6 +12,7 @@ from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
 from app.archives.repository import IncidentRepository, ApprovalRepository, IntakeRepository, VaultRepository, DossierRepository
 from app.archives.validation import require_code
+from app.archives.secrecy_policy import SecrecyPolicy
 from app.services.audit import AuditService
 
 
@@ -73,14 +74,38 @@ class DossierLifecycleService:
         data = {**data, "dossier_code": require_code(data["dossier_code"], "档案编码")}
         if self.dossiers.by_code(data["dossier_code"]):
             raise ConflictError("档案编码已经存在")
-        self.batches.get(data["intake_id"])
+        batch = self.batches.get(data["intake_id"])
         if data.get("vault_id"):
             self.vaults.get(data["vault_id"])
         now = to_storage(self.clock.now())
+        suggestion = SecrecyPolicy(self.connection).suggest(
+            project_code=batch["project_code"],
+            asset_type=data["asset_type"],
+            publication_state="unpublished",
+        )
+        initial_level = suggestion["suggested_level"]
         values = dict(data)
-        values.update(lifecycle_state="available", custody_user_id=principal.user_id, provenance_depth=0)
+        values.update(
+            lifecycle_state="available",
+            custody_user_id=principal.user_id,
+            provenance_depth=0,
+            secrecy_level=initial_level,
+            publication_state="unpublished",
+        )
         dossier = self.dossiers.create(values, now)
-        self.dossiers.append_event(dossier["id"], "received", principal.user_id, now, to_state="available", details={"intake_id": data["intake_id"]})
+        self.dossiers.append_event(dossier["id"], "received", principal.user_id, now, to_state="available", details={"intake_id": data["intake_id"], "initial_secrecy_level": initial_level})
+        self.connection.execute(
+            """INSERT INTO secrecy_level_history(
+                   dossier_id,request_id,change_kind,old_level,new_level,effective_at,
+                   reason,basis_code,actor_user_id,actor_name,created_at
+               ) VALUES(?,NULL,'initial',NULL,?,?,?,?,?,?,?)""",
+            (
+                dossier["id"], initial_level, now,
+                f"登记时按策略建议定级：{suggestion['rationale']}",
+                "initial_policy_suggestion",
+                principal.user_id, principal.display_name, now,
+            ),
+        )
         self.batches.update_counts(data["intake_id"], now)
         self.audit.record(principal, "dossier.register", "dossier", str(dossier["id"]), after=dossier)
         return dossier
@@ -130,11 +155,24 @@ class DossierLifecycleService:
                     "lifecycle_state": "available",
                     "vault_id": item.get("vault_id", parent["vault_id"]),
                     "custody_user_id": principal.user_id,
+                    "secrecy_level": parent["secrecy_level"],
+                    "publication_state": parent["publication_state"],
                     "provenance_depth": parent["provenance_depth"] + 1,
                 },
                 now,
             )
             self.dossiers.append_event(child["id"], "issue_copy.created", principal.user_id, now, to_state="available", details={"source_dossier_id": dossier_id})
+            self.connection.execute(
+                """INSERT INTO secrecy_level_history(
+                       dossier_id,request_id,change_kind,old_level,new_level,effective_at,
+                       reason,basis_code,actor_user_id,actor_name,created_at
+                   ) VALUES(?,NULL,'initial',NULL,?,?,?,?,?,?,?)""",
+                (
+                    child["id"], parent["secrecy_level"], now,
+                    f"受控副本继承来源档案密级（{parent['dossier_code']}）",
+                    "inherit_from_source", principal.user_id, principal.display_name, now,
+                ),
+            )
             children.append(child)
         operation_code = data.get("operation_code") or f"ALI-{uuid.uuid4().hex[:12]}"
         self.connection.execute(
