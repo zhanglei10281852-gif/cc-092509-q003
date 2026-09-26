@@ -189,6 +189,10 @@ CREATE TABLE IF NOT EXISTS dossiers (
     lifecycle_state TEXT NOT NULL CHECK(lifecycle_state IN ('received','available','access_loaned','partially_disclosed','disclosed','quarantined','pending_disposal','disposed')),
     vault_id INTEGER REFERENCES vault_locations(id),
     custody_user_id INTEGER REFERENCES users(id),
+    secrecy_level TEXT NOT NULL DEFAULT 'internal'
+        CHECK(secrecy_level IN ('internal','confidential','restricted','top_secret')),
+    production_started_at TEXT,
+    patent_published_at TEXT,
     provenance_depth INTEGER NOT NULL DEFAULT 0,
     version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
@@ -335,6 +339,81 @@ CREATE TABLE IF NOT EXISTS dossier_events (
     occurred_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_dossier_events_dossier ON dossier_events(dossier_id, id);
+
+CREATE TABLE IF NOT EXISTS secrecy_policies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_code TEXT NOT NULL UNIQUE,
+    project_code TEXT NOT NULL,
+    asset_type TEXT NOT NULL,
+    stage TEXT NOT NULL CHECK(stage IN ('research','production','patent_published','any')),
+    suggested_level TEXT NOT NULL CHECK(suggested_level IN ('internal','confidential','restricted','top_secret')),
+    basis TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 100,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+    created_by INTEGER REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_secrecy_policies_match
+    ON secrecy_policies(active, project_code, asset_type, stage);
+
+CREATE TABLE IF NOT EXISTS secrecy_adjustments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    adjustment_code TEXT NOT NULL UNIQUE,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    direction TEXT NOT NULL CHECK(direction IN ('upgrade','downgrade')),
+    from_level TEXT NOT NULL CHECK(from_level IN ('internal','confidential','restricted','top_secret')),
+    to_level TEXT NOT NULL CHECK(to_level IN ('internal','confidential','restricted','top_secret')),
+    reason TEXT NOT NULL,
+    basis TEXT NOT NULL,
+    requested_by INTEGER NOT NULL REFERENCES users(id),
+    requested_at TEXT NOT NULL,
+    review_deadline TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','approved','rejected','expired','cancelled')),
+    policy_id INTEGER REFERENCES secrecy_policies(id),
+    required_reviews INTEGER NOT NULL CHECK(required_reviews IN (1,2)),
+    reviewed_at TEXT,
+    reviewed_by INTEGER REFERENCES users(id),
+    review_comment TEXT NOT NULL DEFAULT '',
+    effective_at TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK(from_level <> to_level)
+);
+CREATE INDEX IF NOT EXISTS idx_secrecy_adjustments_dossier ON secrecy_adjustments(dossier_id, id);
+CREATE INDEX IF NOT EXISTS idx_secrecy_adjustments_state ON secrecy_adjustments(state, review_deadline);
+
+CREATE TABLE IF NOT EXISTS secrecy_adjustment_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    adjustment_id INTEGER NOT NULL REFERENCES secrecy_adjustments(id) ON DELETE CASCADE,
+    reviewer_user_id INTEGER NOT NULL REFERENCES users(id),
+    decision TEXT NOT NULL CHECK(decision IN ('approve','reject')),
+    comment TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    UNIQUE(adjustment_id, reviewer_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS temporary_declassifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    grant_code TEXT NOT NULL UNIQUE,
+    dossier_id INTEGER NOT NULL REFERENCES dossiers(id),
+    access_session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    granted_by INTEGER NOT NULL REFERENCES users(id),
+    granted_level TEXT NOT NULL CHECK(granted_level IN ('internal','confidential','restricted','top_secret')),
+    purpose TEXT NOT NULL,
+    granted_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
+    revoke_reason TEXT NOT NULL DEFAULT '',
+    revoked_by INTEGER REFERENCES users(id),
+    last_used_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_temp_declass_dossier ON temporary_declassifications(dossier_id, id);
+CREATE INDEX IF NOT EXISTS idx_temp_declass_session ON temporary_declassifications(access_session_id);
+CREATE INDEX IF NOT EXISTS idx_temp_declass_expires ON temporary_declassifications(expires_at);
 """
 
 PERMISSIONS = [
@@ -353,6 +432,12 @@ PERMISSIONS = [
     ("approvals.decide", "审批高风险操作", "approvals", "decide"),
     ("vaults.read_sensitive", "查看精确密级库位", "vaults", "read_sensitive"),
     ("incidents.manage", "管理泄密事件", "incidents", "manage"),
+    ("secrecy.read", "查看密级与调整历史", "secrecy", "read"),
+    ("secrecy.adjust", "发起密级调整申请", "secrecy", "adjust"),
+    ("secrecy.review_upgrade", "复核密级升级", "secrecy", "review_upgrade"),
+    ("secrecy.review_downgrade", "复核密级降级", "secrecy", "review_downgrade"),
+    ("secrecy.temp_declass", "签发临时解密授权", "secrecy", "temp_declass"),
+    ("secrecy.policy.manage", "维护密级策略", "secrecy", "policy_manage"),
 ]
 
 
@@ -432,10 +517,14 @@ def init_db() -> None:
             "dossier_manager": [
                 "dossiers.read", "dossiers.write", "dossiers.disclose", "dossiers.dispose",
                 "access_loans.manage", "inventory_review.manage", "incidents.manage",
+                "secrecy.read", "secrecy.adjust", "secrecy.temp_declass",
             ],
-            "researcher": ["dossiers.read", "dossiers.disclose"],
-            "approver": ["dossiers.read", "approvals.decide"],
-            "auditor": ["dossiers.read", "audit.read"],
+            "researcher": ["dossiers.read", "dossiers.disclose", "secrecy.read"],
+            "approver": [
+                "dossiers.read", "approvals.decide",
+                "secrecy.read", "secrecy.review_upgrade", "secrecy.review_downgrade",
+            ],
+            "auditor": ["dossiers.read", "audit.read", "secrecy.read"],
         }
         for role_code, permission_codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
@@ -445,6 +534,24 @@ def init_db() -> None:
                 f"SELECT ?,id,? FROM permissions WHERE code IN ({placeholders})",
                 (role_id, now, *permission_codes),
             )
+        if connection.execute("SELECT COUNT(*) FROM secrecy_policies").fetchone()[0] == 0:
+            default_policies = (
+                ("SEC-DEFAULT-RD", "*", "*", "research", "restricted",
+                 "默认制度：研发试验阶段技术秘密按机密管理", 900),
+                ("SEC-DEFAULT-MFG", "*", "*", "production", "top_secret",
+                 "默认制度：进入量产后工艺与配方价值升高，升为绝密", 900),
+                ("SEC-DEFAULT-PUB", "*", "*", "patent_published", "internal",
+                 "默认制度：专利公开日后技术细节已公开，降为内部", 900),
+                ("SEC-SRC-MFG", "*", "源代码介质", "production", "top_secret",
+                 "专项制度：量产源代码介质始终按绝密管理", 100),
+            )
+            for code, project_code, asset_type, stage, level, basis, priority in default_policies:
+                connection.execute(
+                    """INSERT OR IGNORE INTO secrecy_policies(
+                           policy_code,project_code,asset_type,stage,suggested_level,basis,priority,active,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,1,?,?)""",
+                    (code, project_code, asset_type, stage, level, basis, priority, now, now),
+                )
 
 
 def migrate_db() -> None:

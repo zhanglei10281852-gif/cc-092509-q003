@@ -12,6 +12,7 @@ from app.core.errors import ConflictError, NotFoundError, ValidationError
 from app.core.security import Principal
 from app.archives.repository import IncidentRepository, ApprovalRepository, IntakeRepository, VaultRepository, DossierRepository
 from app.archives.validation import require_code
+from app.archives.secrecy import SecrecyPolicyService, derive_stage
 from app.services.audit import AuditService
 
 
@@ -78,9 +79,28 @@ class DossierLifecycleService:
             self.vaults.get(data["vault_id"])
         now = to_storage(self.clock.now())
         values = dict(data)
-        values.update(lifecycle_state="available", custody_user_id=principal.user_id, provenance_depth=0)
+        batch_row = self.connection.execute(
+            "SELECT project_code FROM intake_batches WHERE id=?", (data["intake_id"],)
+        ).fetchone()
+        policy_service = SecrecyPolicyService(self.connection, self.clock)
+        policy = policy_service.match(batch_row["project_code"], data["asset_type"], "research")
+        initial_level = policy["suggested_level"] if policy else "internal"
+        values.update(
+            lifecycle_state="available",
+            custody_user_id=principal.user_id,
+            secrecy_level=initial_level,
+            provenance_depth=0,
+        )
         dossier = self.dossiers.create(values, now)
-        self.dossiers.append_event(dossier["id"], "received", principal.user_id, now, to_state="available", details={"intake_id": data["intake_id"]})
+        self.dossiers.append_event(
+            dossier["id"], "received", principal.user_id, now, to_state="available",
+            details={
+                "intake_id": data["intake_id"],
+                "secrecy_level": initial_level,
+                "secrecy_basis": policy["basis"] if policy else "无匹配策略，默认内部",
+                "policy_id": policy["id"] if policy else None,
+            },
+        )
         self.batches.update_counts(data["intake_id"], now)
         self.audit.record(principal, "dossier.register", "dossier", str(dossier["id"]), after=dossier)
         return dossier
@@ -99,6 +119,7 @@ class DossierLifecycleService:
         dossier = self.dossiers.get(dossier_id)
         dossier["events"] = self.dossiers.events(dossier_id)
         dossier["children"] = self.dossiers.children(dossier_id)
+        dossier["stage"] = derive_stage(dossier, to_storage(self.clock.now()))
         if dossier.get("vault_sensitivity") != "normal" and not (
             "*" in principal.permissions or "vaults.read_sensitive" in principal.permissions
         ):
@@ -130,6 +151,7 @@ class DossierLifecycleService:
                     "lifecycle_state": "available",
                     "vault_id": item.get("vault_id", parent["vault_id"]),
                     "custody_user_id": principal.user_id,
+                    "secrecy_level": parent["secrecy_level"],
                     "provenance_depth": parent["provenance_depth"] + 1,
                 },
                 now,
